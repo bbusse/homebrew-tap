@@ -1,0 +1,85 @@
+---
+# SPDX-FileCopyrightText: Björn Busse <bj.rn@baerlin.eu>
+# SPDX-License-Identifier: BSD-3-Clause
+
+name: Build Bottles
+
+# Dispatch-only. Bottles are built against the runner's macOS version and
+# uploaded as a release asset; consuming them needs root_url in each formula
+# to point at that release.
+on:
+  workflow_dispatch:
+    inputs:
+      formula:
+        description: Formula to bottle (gn, angle, libepoxy, virglrenderer, qemu)
+        required: true
+        default: qemu
+      macos_runner:
+        description: Runner image; must match the macOS the bottle is for
+        required: false
+        default: macos-15
+      release_tag:
+        description: Release tag to upload the bottle to
+        required: false
+        default: bottles
+
+jobs:
+  bottle:
+    name: Bottle ${{ inputs.formula }} on ${{ inputs.macos_runner }}
+    runs-on: ${{ inputs.macos_runner }}
+    timeout-minutes: 360
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Report toolchain
+        run: |
+          sw_vers
+          uname -m
+          brew config | grep -iE 'macOS|CPU|Clang'
+
+      - name: Tap this repository
+        run: |
+          brew tap bbusse/tap "$GITHUB_WORKSPACE"
+          brew trust bbusse/tap
+
+      # vulkan-headers and vulkan-loader collide with angle and qemu
+      # respectively. Unlink rather than --overwrite so nothing is deleted.
+      - name: Unlink conflicting vulkan formulae
+        run: |
+          brew unlink vulkan-headers 2>/dev/null || true
+          brew unlink vulkan-loader 2>/dev/null || true
+          brew uninstall --ignore-dependencies libepoxy 2>/dev/null || true
+
+      - name: Build and bottle
+        run: |
+          brew install --build-bottle "bbusse/tap/${{ inputs.formula }}"
+          brew bottle --json --no-rebuild \
+            "bbusse/tap/${{ inputs.formula }}"
+
+      # Homebrew relocates poured bottles, which invalidates the ad-hoc
+      # signature every Mach-O carries on arm64. The kernel then SIGKILLs with
+      # CODESIGNING/Invalid Page and no output at all. Re-sign after pouring.
+      - name: Verify the built formula runs
+        run: |
+          keg="$(brew --cellar "bbusse/tap/${{ inputs.formula }}")"
+          find "$keg" -type f \( -name '*.dylib' -o -perm -u+x \) \
+            -exec sh -c 'file "$1" | grep -q Mach-O && codesign --force --sign - "$1"' _ {} \; \
+            2>/dev/null || true
+          if [ "${{ inputs.formula }}" = "qemu" ]; then
+            qemu-system-aarch64 --version
+            qemu-system-aarch64 -display help
+            qemu-system-aarch64 -device help | grep virtio-gpu-gl
+          fi
+
+      - name: Upload bottle and json
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          files: |
+            *.bottle.tar.gz
+            *.bottle.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

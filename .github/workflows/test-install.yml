@@ -1,0 +1,43 @@
+---
+# SPDX-FileCopyrightText: Björn Busse <bj.rn@baerlin.eu>
+# SPDX-License-Identifier: BSD-3-Clause
+
+name: Test-install formulae
+
+# Builds and installs every formula in this tap from source on an
+# Apple-silicon runner. The heavy lifting lives in the shared workflow;
+# only the tap-specific conflict handling is here.
+
+on:
+  push:
+    branches:
+      - ci
+  workflow_dispatch:
+    inputs:
+      formulae:
+        description: Formulae to test (space-separated; empty means all)
+        required: false
+        default: ''
+  schedule:
+    # Catch upstream/toolchain drift even when nothing here changes.
+    - cron: '30 4 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  test-install:
+    uses: bbusse/github-workflows/.github/workflows/test-brew-formulae.yml@dev
+    with:
+      tap: bbusse/tap
+      formulae: ${{ inputs.formulae || '' }}
+      macos_runner: macos-15
+      # vju, scream and mug are HEAD-only; test their dev branch, not main.
+      head_branch: dev
+      # vulkan-headers and vulkan-loader collide with angle and qemu
+      # respectively; unlink rather than --overwrite so nothing is deleted.
+      # libepoxy has to be rebuilt against this tap's deps.
+      setup_script: |
+        brew unlink vulkan-headers 2>/dev/null || true
+        brew unlink vulkan-loader 2>/dev/null || true
+        brew uninstall --ignore-dependencies libepoxy 2>/dev/null || true
