@@ -1,0 +1,176 @@
+class Qemu < Formula
+  desc "Generic and open source machine emulator and virtualizer"
+  homepage "https://www.qemu.org/"
+  license "GPL-2.0-or-later"
+
+  version "1.0.27"
+  url "https://github.com/startergo/homebrew-qemu-virgl-kosmickrisp/archive/refs/tags/v1.0.27.tar.gz"
+  sha256 "3696476c21ad644ac3f5d30d968096b596649f4970f4031ffa49f1c551eaf990"
+  head "https://gitlab.com/qemu-project/qemu.git", branch: "master"
+
+  bottle do
+    root_url "https://github.com/startergo/homebrew-qemu-virgl-kosmickrisp/releases/download/v1.0.27"
+    sha256 arm64_sequoia: "a2eaeed6f7b52661436052b413f596785c5e14e2e1b65cd5509713fcfc164566"
+  end
+
+  # Dependencies for GPU acceleration
+  depends_on "bbusse/tap/virglrenderer"
+
+  # Core dependencies
+  depends_on "coreutils"
+  depends_on "dtc"
+  depends_on "glib"
+  depends_on "gnutls"
+  # user-mode networking; without it qemu is built with no "user" netdev
+  # and the only option left on macOS is vmnet-shared, which needs root
+  depends_on "libslirp"
+  depends_on "pixman"
+  depends_on "libtool" => :build
+  depends_on "pkg-config" => :build
+  depends_on "ninja" => :build
+  depends_on "meson" => :build
+  depends_on "python@3" => :build
+  depends_on "gettext"
+  depends_on "jpeg-turbo"
+  depends_on "libpng"
+  depends_on "libssh"
+  depends_on "libusb"
+  depends_on "lzo"
+  depends_on "ncurses"
+  depends_on "nettle"
+  depends_on "sdl2"
+  depends_on "snappy"
+  depends_on "spice-protocol"
+  depends_on "vde"
+  depends_on "gmp"
+  depends_on "zstd"
+
+  def install
+    # Install pyyaml for meson
+    system "python3", "-m", "pip", "install", "--break-system-packages", "pyyaml"
+
+    # Pinned upstream QEMU. Never track master here: the patches below are
+    # written against a specific tree, and an unpinned fetch means the same
+    # formula produces a different QEMU on every build
+    upstream_commit = "2be159078ea26feac4c9c9902acf8906f1a05c2a"
+    upstream_url = "https://gitlab.com/qemu-project/qemu/-/archive/" \
+                   "#{upstream_commit}/qemu-#{upstream_commit}.tar.gz"
+    ohai "Downloading upstream QEMU #{upstream_commit}"
+    system "curl", "-L", upstream_url, "-o", "qemu.tar.gz"
+    system "tar", "-xzf", "qemu.tar.gz", "--strip-components=1"
+
+    # Apply audio/coreaudio fixes from qemu-opengl41.patch
+    # NOTE: Disabled - included in texture-borrowing patch
+    # patch_audio = "#{__dir__}/../patches/qemu-audio-coreaudio.patch"
+    # if File.exist?(patch_audio)
+    #   ohai "Applying audio/coreaudio fixes..."
+    #   system "patch", "-p1", "--batch", "--verbose", "-i", patch_audio
+    # end
+
+    # @akihikodaki's VirGL 3D macOS texture-borrowing work, rebased onto the
+    # pinned tree above. Graphics only: the upstream patch also carried
+    # coreaudio changes, which are unrelated to virgl and no longer apply.
+    # The HiDPI and keymap hunks were dropped as upstream absorbed them
+    patch_gfx = "#{__dir__}/../patches/qemu-virgl-gfx-11.1.50.patch"
+    ohai "Applying VirGL 3D macOS graphics patch..."
+    system "patch", "-p1", "--batch", "--verbose", "-i", patch_gfx
+
+    # Apply NSOpenGLContext fix for Desktop GL (gl=core)
+    # NOTE: Disabled - conflicts with current upstream QEMU
+    # patch_nsopengl = "#{__dir__}/../patches/qemu-virgl3d-macos-nsopengl.patch"
+    # ohai "Applying NSOpenGLContext fix for Desktop GL..."
+    # system "patch", "-p1", "--batch", "--verbose", "-i", patch_nsopengl
+
+    # Download and install Vulkan SDK with KosmicKrisp for Venus support
+    # KosmicKrisp is an optional component that must be explicitly selected
+    vulkan_sdk_version = "1.4.335.1"
+    vulkan_sdk_url = "https://sdk.lunarg.com/sdk/download/#{vulkan_sdk_version}/mac/vulkansdk-macos-#{vulkan_sdk_version}.zip"
+    ohai "Downloading Vulkan SDK..."
+    system "curl", "-L", vulkan_sdk_url, "-o", "vulkan-sdk.zip"
+    system "unzip", "-q", "vulkan-sdk.zip"
+
+    # Run installer with KosmicKrisp component (downloads from cloud)
+    # Use --cache-path to set writable cache directory in buildpath
+    vulkan_app = "vulkansdk-macOS-#{vulkan_sdk_version}.app"
+    vulkan_install_path = "#{buildpath}/vulkan-sdk"
+    qt_cache_path = "#{buildpath}/qt-cache"
+    mkdir_p qt_cache_path
+    ohai "Installing Vulkan SDK with KosmicKrisp (this may take a while)..."
+
+    with_env(QT_QPA_PLATFORM: "offscreen") do
+      system "#{vulkan_app}/Contents/MacOS/vulkansdk-macOS-#{vulkan_sdk_version}",
+             "--root", vulkan_install_path,
+             "--cache-path", qt_cache_path,
+             "--accept-licenses",
+             "--default-answer",
+             "--confirm-command",
+             "install", "com.lunarg.vulkan.core", "com.lunarg.vulkan.kosmic"
+    end
+
+    # Copy Vulkan runtime files (loader, KosmicKrisp driver, ICD)
+    mkdir_p "#{share}/vulkan/icd.d"
+    mkdir_p "#{lib}"
+    cp "#{vulkan_install_path}/macOS/share/vulkan/icd.d/libkosmickrisp_icd.json", "#{share}/vulkan/icd.d/"
+    cp "#{vulkan_install_path}/macOS/lib/libvulkan_kosmickrisp.dylib", "#{lib}/"
+    cp "#{vulkan_install_path}/macOS/lib/libvulkan.1.4.335.dylib", "#{lib}/"
+    ln_sf "libvulkan.1.4.335.dylib", "#{lib}/libvulkan.1.dylib"
+    ln_sf "libvulkan.1.dylib", "#{lib}/libvulkan.dylib"
+
+    # Get dependency paths for GPU acceleration   
+    angle = Formula["bbusse/tap/angle"]
+    libepoxy = Formula["bbusse/tap/libepoxy"]
+    virglrenderer = Formula["bbusse/tap/virglrenderer"]    
+    
+    angle_pc_path = "#{angle.lib}/pkgconfig"
+    libepoxy_pc_path = "#{libepoxy.lib}/pkgconfig"
+    virglrenderer_pc_path = "#{virglrenderer.lib}/pkgconfig"
+
+    # Combine pkg-config paths
+    combined_pc_path = "#{virglrenderer_pc_path}:#{libepoxy_pc_path}:#{angle_pc_path}"
+
+    # Configure QEMU with virglrenderer and GPU acceleration support
+    args = %W[
+      --prefix=#{prefix}
+      --cc=#{ENV.cc}
+      --host-cc=#{ENV.cc}
+      --enable-virglrenderer
+      --enable-opengl
+      --enable-cocoa
+      --disable-gtk
+      --disable-guest-agent
+      --disable-guest-agent-msi
+    ]
+
+    # Set pkg-config path for dependencies
+    ENV["PKG_CONFIG_PATH"] = "#{combined_pc_path}:#{ENV["PKG_CONFIG_PATH"]}"
+
+    # Set library path for runtime linking
+    ENV["DYLD_FALLBACK_LIBRARY_PATH"] = "#{virglrenderer.lib}:#{libepoxy.lib}:#{angle.lib}:#{ENV["DYLD_FALLBACK_LIBRARY_PATH"]}"
+
+    # Add smbd path
+    args << "--smbd=#{HOMEBREW_PREFIX}/sbin/samba-dot-org-smbd"
+    
+    # Only build specific targets: aarch64, x86_64, and i386
+    args << "--target-list=aarch64-softmmu,x86_64-softmmu,i386-softmmu"
+
+
+    system "./configure", *args
+    system "make", "-j#{ENV.make_jobs}"
+    system "make", "install"
+
+    # Add rpath so dlopen finds ANGLE libraries at runtime
+    # ANGLE uses @rpath/libEGL.dylib, so we need rpath to HOMEBREW_PREFIX/lib
+    Dir["#{bin}/*"].each do |binary|
+      system "install_name_tool", "-add_rpath", "#{HOMEBREW_PREFIX}/lib", binary
+    end
+  end
+
+  # No post_install needed - rpath is set during install
+
+  test do
+    # Test that qemu-system-x86_64 runs and shows version
+    system bin/"qemu-system-x86_64", "--version"
+    # Test qemu-img
+    system bin/"qemu-img", "--version"
+  end
+end
